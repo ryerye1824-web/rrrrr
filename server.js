@@ -1180,7 +1180,20 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
 
 // Full oversight view: every group with its members and pending requests.
 app.get('/api/admin/groups', requireAdmin, asyncRoute(async (req, res) => {
-  const [groups] = await pool.query('SELECT id, name, balance FROM `groups`');
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
+  const offset = (page - 1) * pageSize;
+  const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
+  const whereClause = search ? 'WHERE name LIKE ?' : '';
+  const params = search ? [search] : [];
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM \`groups\` ${whereClause}`, params);
+
+  const [groups] = await pool.query(
+    `SELECT id, name, balance FROM \`groups\` ${whereClause} ORDER BY name ASC LIMIT ? OFFSET ?`,
+    [...params, pageSize, offset]
+  );
+
   for (const g of groups) {
     g.balance = toCentavos(g.balance);
     const [members] = await pool.execute(
@@ -1197,7 +1210,8 @@ app.get('/api/admin/groups', requireAdmin, asyncRoute(async (req, res) => {
     g.members = members;
     g.pendingRequests = requests.map((r) => ({ ...r, amount: toCentavos(r.amount) }));
   }
-  res.json(groups);
+
+  res.json({ groups, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
 }));
 
 // Admin removes a member from a group.
@@ -1575,7 +1589,24 @@ app.post('/api/loans/:id/repay', requireAuth, asyncRoute(async (req, res) => {
 // whether THIS admin has already decided on it (so the UI can hide the
 // buttons instead of letting them try to vote twice and get a 409).
 app.get('/api/admin/loans', requireAdmin, asyncRoute(async (req, res) => {
-  const [rows] = await pool.execute(
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
+  const offset = (page - 1) * pageSize;
+  const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
+  const status = ['pending', 'approved', 'declined', 'repaid'].includes(req.query.status) ? req.query.status : null;
+
+  const conditions = [];
+  const params = [];
+  if (search) { conditions.push('u.username LIKE ?'); params.push(search); }
+  if (status) { conditions.push('l.status = ?'); params.push(status); }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM loans l JOIN users u ON u.id = l.user_id ${whereClause}`,
+    params
+  );
+
+  const [rows] = await pool.query(
     `SELECT l.id, l.loan_type AS loanType, l.amount, l.purpose, l.term_months AS termMonths, l.status,
             l.applicant_age AS applicantAge, l.government_id AS governmentId,
             l.amount_repaid AS amountRepaid, l.created_at, l.approvals_needed AS approvalsNeeded, u.username,
@@ -1583,10 +1614,15 @@ app.get('/api/admin/loans', requireAdmin, asyncRoute(async (req, res) => {
             EXISTS(SELECT 1 FROM loan_approvals la WHERE la.loan_id = l.id AND la.admin_id = ?) AS decidedByMe,
             EXISTS(SELECT 1 FROM loan_approvals la WHERE la.loan_id = l.id AND la.admin_id = ? AND la.decision = 'approve') AS approvedByMe
      FROM loans l JOIN users u ON u.id = l.user_id
-     ORDER BY (l.status = 'pending') DESC, l.created_at DESC`,
-    [req.adminId, req.adminId]
+     ${whereClause}
+     ORDER BY (l.status = 'pending') DESC, l.created_at DESC
+     LIMIT ? OFFSET ?`,
+    [req.adminId, req.adminId, ...params, pageSize, offset]
   );
-  res.json(rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) })));
+
+  const loans = rows.map((l) => ({ ...l, amount: toCentavos(l.amount), amountRepaid: toCentavos(l.amountRepaid) }));
+
+  res.json({ loans, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
 }));
 
 app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
