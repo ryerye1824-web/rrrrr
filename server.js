@@ -1137,21 +1137,45 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
 // Full oversight view: every registered user, their balance/wallet, and
 // how many groups they belong to.
 app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
-  const [users] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance,
-            (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
-     FROM users u`
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
+  const offset = (page - 1) * pageSize;
+  const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
+  const sortBy = req.query.sortBy === 'balance' ? 'balance' : 'username';
+
+  const whereClause = search ? 'WHERE u.username LIKE ?' : '';
+  const params = search ? [search] : [];
+
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM users u ${whereClause}`,
+    params
   );
 
-  const normalized = users.map((u) => ({ ...u, balance: toCentavos(u.balance) }));
+  // DB does the heavy lifting (only pulls the rows for this page) — merge
+  // sort still runs, just on the bounded page instead of the whole table,
+  // so it stays fast at any scale while keeping the mandatory sort step.
+  const [rawUsers] = await pool.query(
+    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance,
+            (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
+     FROM users u
+     ${whereClause}
+     LIMIT ? OFFSET ?`,
+    [...params, pageSize, offset]
+  );
 
-  const sortBy = req.query.sortBy === 'balance' ? 'balance' : 'username';
+  const normalized = rawUsers.map((u) => ({ ...u, balance: toCentavos(u.balance) }));
   const sorted =
     sortBy === 'balance'
       ? mergeSort(normalized, comparators.balanceDesc)
       : mergeSort(normalized, comparators.usernameAsc);
 
-  res.json(sorted);
+  res.json({
+    users: sorted,
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+  });
 }));
 
 // Full oversight view: every group with its members and pending requests.
