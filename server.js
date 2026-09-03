@@ -103,7 +103,7 @@ app.use(helmet());
 // CORS is restricted to the actual deployed frontend origin — previously
 // wide open (any website could call this API from a visitor's browser).
 app.use(cors({
-  origin: ['https://paycst11.netlify.app', 'http://localhost:12194', 'http://localhost:3000'],
+  origin: ['https://paycst11.netlify.app', 'http://localhost:12194', 'http://localhost:3000', 'https://taupe-duckanoo-4f033e.netlify.app'],
 }));
 
 app.use(express.json());
