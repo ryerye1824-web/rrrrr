@@ -1139,11 +1139,13 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
   const offset = (page - 1) * pageSize;
-  const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
+    const search = req.query.search ? `%${req.query.search.toString().trim()}%` : null;
   const sortBy = req.query.sortBy === 'balance' ? 'balance' : 'username';
 
-  const whereClause = search ? 'WHERE u.username LIKE ?' : '';
-  const params = search ? [search] : [];
+  // Matches on username OR the numeric ID (cast to text so a partial-ID
+  // search like "12" also matches id 12, 120, 1123, etc.) OR the wallet ID.
+  const whereClause = search ? 'WHERE (u.username LIKE ? OR CAST(u.id AS CHAR) LIKE ? OR u.wallet_id LIKE ?)' : '';
+  const params = search ? [search, search, search] : [];
 
   const [[{ total }]] = await pool.query(
     `SELECT COUNT(*) AS total FROM users u ${whereClause}`,
