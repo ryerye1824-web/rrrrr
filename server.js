@@ -1179,6 +1179,47 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   });
 }));
 
+// Purchase/transaction history for one specific user — powers the
+// "View Purchases" button next to each row in the admin Users tab.
+app.get('/api/admin/users/:id/transactions', requireAdmin, asyncRoute(async (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId)) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 20));
+  const offset = (page - 1) * pageSize;
+
+  const [[user]] = await pool.query('SELECT id, username FROM users WHERE id = ?', [userId]);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const [[{ total }]] = await pool.query(
+    "SELECT COUNT(*) AS total FROM transactions WHERE account_type = 'user' AND account_id = ?",
+    [userId]
+  );
+
+  const [rows] = await pool.query(
+    `SELECT id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
+     FROM transactions
+     WHERE account_type = 'user' AND account_id = ?
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+    [userId, pageSize, offset]
+  );
+
+  const transactions = rows.map((t) => ({ ...t, amount: toCentavos(t.amount) }));
+
+  res.json({
+    username: user.username,
+    transactions,
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+  });
+}));
+
 // Full oversight view: every group with its members and pending requests.
 app.get('/api/admin/groups', requireAdmin, asyncRoute(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
