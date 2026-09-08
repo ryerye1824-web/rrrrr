@@ -406,12 +406,18 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-  const [rows] = await pool.execute('SELECT id, password_hash FROM users WHERE username = ?', [username]);
+    const [rows] = await pool.execute('SELECT id, password_hash, status FROM users WHERE username = ?', [username]);
   const user = rows[0];
   const ok = user && (await bcrypt.compare(password, user.password_hash));
   if (!ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect username or password' });
+  }
+  // Checked AFTER password verification (not before) so a wrong-password
+  // attempt against a suspended account still just says "incorrect
+  // username or password" — it doesn't leak account status to a guesser.
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
   }
   await clearAttempts(identifier);
 
@@ -1155,8 +1161,8 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
   // DB does the heavy lifting (only pulls the rows for this page) — merge
   // sort still runs, just on the bounded page instead of the whole table,
   // so it stays fast at any scale while keeping the mandatory sort step.
-  const [rawUsers] = await pool.query(
-    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance,
+      const [rawUsers] = await pool.query(
+    `SELECT u.id, u.username, u.wallet_id AS walletId, u.balance, u.status,
             (SELECT COUNT(*) FROM group_members gm WHERE gm.user_id = u.id) AS groupCount
      FROM users u
      ${whereClause}
@@ -1178,6 +1184,30 @@ app.get('/api/admin/users', requireAdmin, asyncRoute(async (req, res) => {
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
   });
 }));
+
+// Admin suspends or reactivates a user's account. Suspension blocks login
+// at the password step (before a session token can even be issued) but
+// doesn't touch existing data — balance, groups, and loan history stay
+// intact so reactivating just picks back up where things left off.
+app.post('/api/admin/users/:id/status', requireAdmin, asyncRoute(async (req, res) => {
+  const userId = Number(req.params.id);
+  const suspend = !!req.body?.suspend;
+  if (!Number.isInteger(userId)) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+
+  const [result] = await pool.execute('UPDATE users SET status = ? WHERE id = ?', [
+    suspend ? 'suspended' : 'active',
+    userId,
+  ]);
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  await refreshUserInIndex(userId);
+  res.json({ ok: true, status: suspend ? 'suspended' : 'active' });
+}));
+
 
 // Purchase/transaction history for one specific user — powers the
 // "View Purchases" button next to each row in the admin Users tab.
