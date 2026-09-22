@@ -1111,6 +1111,154 @@ app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) =>
   res.json({ ok: true });
 }));
 
+// ---------- savings goals (personal, locked sub-balance) ----------
+
+app.post('/api/savings', requireAuth, asyncRoute(async (req, res) => {
+  const name = req.body?.name?.toString().trim();
+  const target = parseCentavos(req.body?.targetAmountCentavos);
+  if (!name) return res.status(400).json({ error: 'A goal name is required' });
+  if (target === null) return res.status(400).json({ error: 'A positive target amount (integer centavos) is required' });
+
+  const [result] = await pool.execute(
+    'INSERT INTO savings_goals (user_id, name, target_amount) VALUES (?, ?, ?)',
+    [req.userId, name, target]
+  );
+  res.json({ id: result.insertId, ok: true });
+}));
+
+app.get('/api/savings/mine', requireAuth, asyncRoute(async (req, res) => {
+  const [rows] = await pool.execute(
+    'SELECT id, name, target_amount, saved_amount, status, created_at FROM savings_goals WHERE user_id = ? ORDER BY created_at DESC',
+    [req.userId]
+  );
+  res.json(rows.map((g) => ({
+    ...g,
+    targetAmount: toCentavos(g.target_amount),
+    savedAmount: toCentavos(g.saved_amount),
+  })));
+}));
+
+app.post('/api/savings/:id/deposit', requireAuth, asyncRoute(async (req, res) => {
+  const goalId = Number(req.params.id);
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[goal]] = await conn.query(
+      'SELECT * FROM savings_goals WHERE id = ? AND user_id = ? FOR UPDATE',
+      [goalId, req.userId]
+    );
+    if (!goal) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    const [[user]] = await conn.query('SELECT balance FROM users WHERE id = ? FOR UPDATE', [req.userId]);
+    if (toCentavos(user.balance) < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    const newSaved = toCentavos(goal.saved_amount) + amt;
+    const nowComplete = newSaved >= toCentavos(goal.target_amount);
+
+    await conn.execute('UPDATE users SET balance = balance - ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute('UPDATE savings_goals SET saved_amount = ?, status = ? WHERE id = ?', [
+      newSaved, nowComplete ? 'completed' : 'active', goalId,
+    ]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['user', req.userId, `Savings: ${goal.name}`, 'Savings Deposit', amt, 0]
+    );
+
+    await conn.commit();
+    await refreshUserInIndex(req.userId);
+    res.json({ ok: true, savedAmount: newSaved, completed: nowComplete });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
+app.post('/api/savings/:id/withdraw', requireAuth, asyncRoute(async (req, res) => {
+  const goalId = Number(req.params.id);
+  const amt = parseCentavos(req.body?.amountCentavos);
+  if (amt === null) return res.status(400).json({ error: 'A positive amount (integer centavos) is required' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[goal]] = await conn.query(
+      'SELECT * FROM savings_goals WHERE id = ? AND user_id = ? FOR UPDATE',
+      [goalId, req.userId]
+    );
+    if (!goal) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    const saved = toCentavos(goal.saved_amount);
+    if (saved < amt) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Not enough saved in this goal' });
+    }
+
+    const newSaved = saved - amt;
+    await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amt, req.userId]);
+    await conn.execute('UPDATE savings_goals SET saved_amount = ?, status = ? WHERE id = ?', [
+      newSaved, 'active', goalId,
+    ]);
+    await conn.execute(
+      'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+      ['user', req.userId, `Savings withdrawal: ${goal.name}`, 'Savings Withdrawal', amt, 1]
+    );
+
+    await conn.commit();
+    await refreshUserInIndex(req.userId);
+    res.json({ ok: true, savedAmount: newSaved });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
+app.delete('/api/savings/:id', requireAuth, asyncRoute(async (req, res) => {
+  const goalId = Number(req.params.id);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[goal]] = await conn.query(
+      'SELECT * FROM savings_goals WHERE id = ? AND user_id = ? FOR UPDATE',
+      [goalId, req.userId]
+    );
+    if (!goal) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Goal not found' });
+    }
+    const saved = toCentavos(goal.saved_amount);
+    if (saved > 0) {
+      await conn.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [saved, req.userId]);
+      await conn.execute(
+        'INSERT INTO transactions (account_type, account_id, label, type, amount, is_credit) VALUES (?,?,?,?,?,?)',
+        ['user', req.userId, `Closed goal: ${goal.name}`, 'Savings Withdrawal', saved, 1]
+      );
+    }
+    await conn.execute('DELETE FROM savings_goals WHERE id = ?', [goalId]);
+    await conn.commit();
+    await refreshUserInIndex(req.userId);
+    res.json({ ok: true, returnedCentavos: saved });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}));
+
 // ---------- admin: login + final say on groups (item #13) ----------
 
 app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
