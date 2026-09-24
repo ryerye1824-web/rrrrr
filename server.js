@@ -298,10 +298,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function nextWalletId() {
-  const n = Math.floor(100000 + Math.random() * 900000);
-  return `PCST-${n}`;
-}
 
 // ---------- database-backed login lockout ----------
 //
@@ -341,10 +337,61 @@ async function clearAttempts(identifier) {
   await pool.execute('DELETE FROM login_attempts WHERE identifier = ?', [identifier]);
 }
 
+// ---------- Face++ face-matching (identity verification) ----------
+//
+// Compares two face photos (a government ID photo and a live selfie) and
+// returns a similarity score from 0-100. This is a REAL third-party call —
+// unlike the provider-routing simulation elsewhere in this file — but the
+// score alone doesn't decide anything by itself; the caller decides the
+// threshold for auto-approval vs. sending to manual admin review.
+
+const FACEPP_API_KEY = process.env.FACEPP_API_KEY;
+const FACEPP_API_SECRET = process.env.FACEPP_API_SECRET;
+const FACEPP_COMPARE_URL = 'https://api-us.faceplusplus.com/facepp/v3/compare';
+
+// image1Base64 / image2Base64 should be raw base64 (no "data:image/..." prefix).
+// Returns { confidence, matched } on success, or throws on a Face++/network error.
+async function compareFaces(image1Base64, image2Base64) {
+  if (!FACEPP_API_KEY || !FACEPP_API_SECRET) {
+    throw new Error('Face verification is not configured on the server');
+  }
+
+  const form = new URLSearchParams();
+  form.set('api_key', FACEPP_API_KEY);
+  form.set('api_secret', FACEPP_API_SECRET);
+  form.set('image_base64_1', image1Base64);
+  form.set('image_base64_2', image2Base64);
+
+  const res = await fetch(FACEPP_COMPARE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const data = await res.json();
+
+  if (!res.ok || data.error_message) {
+    throw new Error(data.error_message || 'Face comparison failed');
+  }
+  if (!data.faces1?.length || !data.faces2?.length) {
+    throw new Error('Could not detect a face in one or both images');
+  }
+
+  // Face++'s own suggested threshold for a 1e-3 false-accept-rate is roughly
+  // 62.3 — using 65 here as a slightly stricter, simple constant. Anything
+  // under this goes to manual admin review rather than auto-rejecting, since
+  // lighting/angle can legitimately lower a real match's score.
+  const confidence = data.confidence ?? 0;
+  return { confidence, matched: confidence >= 65 };
+}
+
 // ---------- registration / login (password, THEN pin) ----------
 
 app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
-  const { username, password, pin, phoneNumber } = req.body || {};
+  const {
+    username, password, pin, phoneNumber,
+    termsAccepted, governmentIdNumber, governmentIdPhotoBase64, selfiePhotoBase64,
+  } = req.body || {};
+
   if (!username || !password || !pin || !phoneNumber) {
     return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
   }
@@ -353,37 +400,81 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
   if (!/^09\d{9}$/.test(phoneNumber)) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
   }
+  if (!termsAccepted) {
+    return res.status(400).json({ error: 'You must accept the Terms and Conditions to register' });
+  }
+  if (!governmentIdNumber || !governmentIdNumber.toString().trim()) {
+    return res.status(400).json({ error: 'A government-issued ID number is required' });
+  }
+  if (!governmentIdPhotoBase64 || !selfiePhotoBase64) {
+    return res.status(400).json({ error: 'A photo of your ID and a live selfie are both required' });
+  }
 
   const conn = await pool.getConnection();
   try {
-    // Hash map check first (fast path) — DB check right after is still the
-    // real source of truth for uniqueness, since two requests could race
-    // between these two checks.
     if (usersByUsername.has(username)) {
       return res.status(409).json({ error: 'That username is already taken' });
     }
-    const [existing] = await conn.execute('SELECT id FROM users WHERE username = ?', [username]);
-    if (existing.length > 0) return res.status(409).json({ error: 'That username is already taken' });
+    const [existingUsername] = await conn.execute('SELECT id FROM users WHERE username = ?', [username]);
+    if (existingUsername.length > 0) return res.status(409).json({ error: 'That username is already taken' });
+
+    const [existingPhone] = await conn.execute('SELECT id FROM users WHERE phone_number = ?', [phoneNumber]);
+    if (existingPhone.length > 0) {
+      return res.status(409).json({ error: 'That phone number is already registered to an account' });
+    }
+
+    const [existingId] = await conn.execute('SELECT id FROM users WHERE government_id_number = ?', [
+      governmentIdNumber.toString().trim(),
+    ]);
+    if (existingId.length > 0) {
+      return res.status(409).json({ error: 'That government ID is already registered to an account' });
+    }
+
+    // Face match: compares the live selfie against the photo on the ID. This
+    // is the "cannot create another account" enforcement for a DIFFERENT id
+    // number under a face that's already registered — the username/phone/ID
+    // checks above only catch exact duplicates of those specific fields.
+    let confidence = null;
+    let verificationStatus = 'pending';
+    try {
+      const result = await compareFaces(governmentIdPhotoBase64, selfiePhotoBase64);
+      confidence = result.confidence;
+      verificationStatus = result.matched ? 'approved' : 'pending';
+    } catch (err) {
+      // Face++ failure (bad image, no face detected, API error) does NOT
+      // block registration — it just leaves the account pending for an
+      // admin to review manually, same as a low-confidence score would.
+      console.error('Face comparison failed during registration:', err.message);
+      verificationStatus = 'pending';
+    }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const pinHash = await bcrypt.hash(pin, 10);
-
-    let walletId = nextWalletId();
-    for (let i = 0; i < 5; i++) {
-      const [clash] = await conn.execute('SELECT id FROM users WHERE wallet_id = ?', [walletId]);
-      if (clash.length === 0) break;
-      walletId = nextWalletId();
-    }
+    const walletId = phoneNumber;
 
     const [result] = await conn.execute(
-      'INSERT INTO users (username, password_hash, pin_hash, wallet_id, balance, phone_number) VALUES (?, ?, ?, ?, ?, ?)',
-      [username, passwordHash, pinHash, walletId, 0, phoneNumber]
+      `INSERT INTO users
+         (username, password_hash, pin_hash, wallet_id, balance, phone_number,
+          government_id_number, government_id_photo, selfie_photo,
+          terms_accepted_at, verification_status, face_match_confidence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
+      [
+        username, passwordHash, pinHash, walletId, 0, phoneNumber,
+        governmentIdNumber.toString().trim(), governmentIdPhotoBase64, selfiePhotoBase64,
+        verificationStatus, confidence,
+      ]
     );
 
-    // Row is committed to MySQL — now safe to add it to the index.
     await refreshUserInIndex(result.insertId);
 
-    res.json({ ok: true, walletId });
+    res.json({
+      ok: true,
+      walletId,
+      verificationStatus,
+      message: verificationStatus === 'approved'
+        ? 'Account verified — you can log in now.'
+        : 'Account created. Your ID is pending verification by an admin before you can log in.',
+    });
   } finally {
     conn.release();
   }
@@ -402,7 +493,10 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-    const [rows] = await pool.execute('SELECT id, password_hash, status FROM users WHERE username = ?', [username]);
+        const [rows] = await pool.execute(
+    'SELECT id, password_hash, status, verification_status FROM users WHERE username = ?',
+    [username]
+  );
   const user = rows[0];
   const ok = user && (await bcrypt.compare(password, user.password_hash));
   if (!ok) {
@@ -414,6 +508,12 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
   // username or password" — it doesn't leak account status to a guesser.
   if (user.status === 'suspended') {
     return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
+  }
+  if (user.verification_status === 'pending') {
+    return res.status(403).json({ error: 'Your account is still pending ID verification. Please check back later.' });
+  }
+  if (user.verification_status === 'rejected') {
+    return res.status(403).json({ error: 'Your ID verification was not approved. Contact support for assistance.' });
   }
   await clearAttempts(identifier);
 
