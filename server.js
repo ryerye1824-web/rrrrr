@@ -2108,6 +2108,43 @@ app.get('/api/routes/compare', requireAuth, (req, res) => {
   res.json({ simulated: true, source, destination, ...result });
 });
 
+// ---------- admin: identity verification review ----------
+
+app.get('/api/admin/verifications/pending', requireAdmin, asyncRoute(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, username, phone_number AS phoneNumber, government_id_number AS governmentIdNumber,
+            government_id_photo AS governmentIdPhotoFront, government_id_photo_back AS governmentIdPhotoBack,
+            selfie_photo AS selfiePhoto, face_match_confidence AS faceMatchConfidence, created_at AS createdAt
+     FROM users
+     WHERE verification_status = 'pending'
+     ORDER BY created_at ASC`
+  );
+  res.json(rows);
+}));
+
+app.post('/api/admin/verifications/:id/respond', requireAdmin, asyncRoute(async (req, res) => {
+  const userId = Number(req.params.id);
+  const approve = !!req.body?.approve;
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+  const [[user]] = await pool.query(
+    "SELECT id, verification_status FROM users WHERE id = ?",
+    [userId]
+  );
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.verification_status !== 'pending') {
+    return res.status(409).json({ error: 'This account has already been decided' });
+  }
+
+  await pool.execute('UPDATE users SET verification_status = ? WHERE id = ?', [
+    approve ? 'approved' : 'rejected',
+    userId,
+  ]);
+
+  await refreshUserInIndex(userId);
+  res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+}));
+
 // This must be registered AFTER every route above it — Express matches
 // error-handling middleware (4-arg signature) only for errors that occur
 // during/after routes already registered before it in the file.
