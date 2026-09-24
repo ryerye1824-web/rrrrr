@@ -387,9 +387,10 @@ async function compareFaces(image1Base64, image2Base64) {
 // ---------- registration / login (password, THEN pin) ----------
 
 app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
-  const {
+   const {
     username, password, pin, phoneNumber,
-    termsAccepted, governmentIdNumber, governmentIdPhotoBase64, selfiePhotoBase64,
+    termsAccepted, governmentIdNumber,
+    governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
   } = req.body || {};
 
   if (!username || !password || !pin || !phoneNumber) {
@@ -406,8 +407,8 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
   if (!governmentIdNumber || !governmentIdNumber.toString().trim()) {
     return res.status(400).json({ error: 'A government-issued ID number is required' });
   }
-  if (!governmentIdPhotoBase64 || !selfiePhotoBase64) {
-    return res.status(400).json({ error: 'A photo of your ID and a live selfie are both required' });
+  if (!governmentIdPhotoFrontBase64 || !governmentIdPhotoBackBase64 || !selfiePhotoBase64) {
+    return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
   }
 
   const conn = await pool.getConnection();
@@ -437,7 +438,7 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
     let confidence = null;
     let verificationStatus = 'pending';
     try {
-      const result = await compareFaces(governmentIdPhotoBase64, selfiePhotoBase64);
+       const result = await compareFaces(governmentIdPhotoFrontBase64, selfiePhotoBase64);
       confidence = result.confidence;
       verificationStatus = result.matched ? 'approved' : 'pending';
     } catch (err) {
@@ -452,15 +453,15 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
     const pinHash = await bcrypt.hash(pin, 10);
     const walletId = phoneNumber;
 
-    const [result] = await conn.execute(
+        const [result] = await conn.execute(
       `INSERT INTO users
          (username, password_hash, pin_hash, wallet_id, balance, phone_number,
-          government_id_number, government_id_photo, selfie_photo,
+          government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
           terms_accepted_at, verification_status, face_match_confidence)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
       [
         username, passwordHash, pinHash, walletId, 0, phoneNumber,
-        governmentIdNumber.toString().trim(), governmentIdPhotoBase64, selfiePhotoBase64,
+        governmentIdNumber.toString().trim(), governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
         verificationStatus, confidence,
       ]
     );
