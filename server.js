@@ -1491,13 +1491,7 @@ app.delete('/api/savings/:id', requireAuth, asyncRoute(async (req, res) => {
   }
 }));
 
-// ---------- admin: login (password, THEN pin — item: admin 2FA) + final say on groups (item #13) ----------
-//
-// Mirrors the user login flow: step 1 only gets a short-lived "pending"
-// token that can't call any admin endpoint on its own — it just unlocks
-// step 2. A previously-issued admin session that predates PIN adoption
-// (payload has no stage) is rejected by requireAdmin the same as any
-// other invalid token, so there's no silent bypass for old tokens either.
+// ---------- admin: login + final say on groups (item #13) ----------
 
 // Step 1: password only.
 app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
@@ -1512,17 +1506,11 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
 
   const [rows] = await pool.execute('SELECT id, password_hash, pin_hash FROM admins WHERE username = ?', [username]);
   const admin = rows[0];
-  // Same timing-safe pattern as /api/login — always compare against a real
-  // bcrypt hash so a nonexistent admin username doesn't return faster than
-  // a wrong-password one.
   const ok = await bcrypt.compare(password || '', admin ? admin.password_hash : DUMMY_BCRYPT_HASH);
   if (!admin || !ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect admin credentials' });
   }
-  // An admin created before PIN support (or whose pin_hash was cleared)
-  // can't be issued a full session — send them to get a PIN set instead
-  // of silently granting single-factor access.
   if (!admin.pin_hash) {
     return res.status(403).json({
       error: 'This admin account has no PIN set yet. Run `npm run create-admin -- <username> <password> <pin>` to set one before logging in.',
@@ -1534,8 +1522,7 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   res.json({ pendingToken });
 }));
 
-// Step 2: the PIN, checked separately from the password. Only after this
-// succeeds does the client get a token any admin endpoint will accept.
+// Step 2: the PIN.
 app.post('/api/admin/login/verify-pin', adminPinLimiter, asyncRoute(async (req, res) => {
   const { pendingToken, pin } = req.body || {};
   const payload = pendingToken && verify(pendingToken);
@@ -2124,13 +2111,13 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
   const loanId = Number(req.params.id);
   const approve = !!req.body?.approve;
 
-  // NEW — enforce FIFO: admins must resolve the oldest pending loan first.
-  const front = loanQueue.peek();
-  if (front && front.loanId !== loanId) {
-    return res.status(409).json({
-      error: `Loans must be processed in submission order — resolve loan #${front.loanId} first`,
-    });
-  }
+  // Oldest-first is enforced as a *display* priority (see GET /api/admin/loans'
+  // ORDER BY and /api/admin/loans/queue/next), not as a hard gate here —
+  // with more than one admin online, forcing everyone through a single
+  // front-of-queue loan serializes all approval work through one door
+  // regardless of admin count. The actual safety against two admins
+  // colliding on the *same* loan comes from the row lock + already-voted
+  // check just below, not from queue order.
 
   const conn = await pool.getConnection();
   try {
@@ -2162,7 +2149,7 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
     if (!approve) {
       await conn.execute("UPDATE loans SET status = 'declined', decided_at = NOW() WHERE id = ?", [loanId]);
       await conn.commit();
-      loanQueue.dequeue(); // NEW — loan is finalized, remove from the front
+      loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
       return res.json({ ok: true, status: 'declined' });
     }
 
@@ -2190,13 +2177,13 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
       await conn.commit();
 
       await refreshUserInIndex(loan.user_id);
-      loanQueue.dequeue(); // NEW — loan is finalized, remove from the front
+      loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
 
       return res.json({ ok: true, status: 'approved' });
     }
 
-    // Still needs more admin approvals — stays at the front of the queue,
-    // since it's not finalized yet.
+    // Still needs more admin approvals — stays in the queue, since it's
+    // not finalized yet.
     await conn.commit();
     res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded: loan.approvals_needed });
   } catch (err) {
