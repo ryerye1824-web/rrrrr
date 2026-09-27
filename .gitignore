@@ -4,3 +4,6 @@ npm-debug.log*
 update_pass.sql
 nodeserver.js.backup
 update_admin_pass.sql
+backup_before_centavos_migration.sql
+temp_migration.sql
+desktop.ini
