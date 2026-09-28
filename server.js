@@ -75,6 +75,8 @@ function getUndoStack(userId) {
 }
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const pool = require('./db');
 const { PROVIDERS, findCheapestRoute } = require('./graph');
 process.on('unhandledRejection', (reason) => {
@@ -100,8 +102,23 @@ app.set('trust proxy', 1);
 // defaults for an API-only server.
 app.use(helmet());
 
-app.use(cors());
-app.use(express.json());
+// CORS is only relevant to browser clients (Flutter mobile doesn't send an
+// Origin header, so this never affects the phone app either way). Set
+// CORS_ORIGIN in .env to a comma-separated allowlist once you know your
+// real web origin(s) (e.g. "https://app.paycst.com,https://paycst.com") to
+// stop arbitrary sites from reading this API in a logged-in user's
+// browser. Left unset, this keeps today's fully-open behavior so nothing
+// breaks before you're ready to lock it down.
+const corsOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)
+  : true; // true = reflect any origin (cors package default)
+app.use(cors({ origin: corsOrigins }));
+// Default express.json() limit is 100kb, which is too small for the
+// base64-encoded ID front/back + selfie photos that /api/register sends —
+// that route was almost certainly failing with a 413 before this. 15mb
+// gives real photos room while still capping the body so a client can't
+// send an unbounded payload as a cheap DoS.
+app.use(express.json({ limit: '15mb' }));
 
 // Rate limiting on the endpoints most worth protecting against
 // brute-force/credential-stuffing. A 4-digit PIN only has 10,000 possible
@@ -157,7 +174,29 @@ const adminLimiter = rateLimit({
   message: { error: 'Too many attempts. Please try again later.' },
 });
 
+// Second factor for admin login, mirroring pinLimiter above — keyed off
+// the pendingToken's uid rather than username/IP for the same reason:
+// this route doesn't carry a username in its body.
+const adminPinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const payload = req.body?.pendingToken && verify(req.body.pendingToken);
+    return payload?.uid ? `adminpin:${payload.uid}` : ipKeyGenerator(req);
+  },
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// A precomputed bcrypt hash of a value nobody will ever type, used to keep
+// login timing constant whether or not the username exists. Without this,
+// a lookup miss returns instantly (skips bcrypt entirely) while a real
+// username takes ~100ms for the hash compare, letting an attacker
+// enumerate valid usernames purely from response time.
+const DUMMY_BCRYPT_HASH = '$2b$10$mmbttYBoG2ai04iUGNVN1e//S9B9Ae8.xo6roaVcGlvA47DDiwhwO';
 const MAX_GROUP_MEMBERS = 6;
 const MAX_CENTAVOS = 100_000_000_00; // ₱100,000,000.00 — sanity ceiling, adjust as you like
 
@@ -177,6 +216,34 @@ async function loadIndexesFromDatabase() {
     usersByWalletId.set(row.wallet_id, row);
   }
   console.log(`Loaded ${rows.length} users into hash map indexes`);
+}
+
+// ---------- live balance push (WebSocket) ----------
+// userId -> Set of open sockets. A user can have more than one (two
+// devices, a hot-reloaded app, etc), so every route just calls
+// refreshUserInIndex(id) as it already did — this rides along on that
+// same call rather than needing its own call site at every transfer.
+const userSockets = new Map();
+
+function registerSocket(userId, ws) {
+  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+  userSockets.get(userId).add(ws);
+}
+
+function unregisterSocket(userId, ws) {
+  const set = userSockets.get(userId);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) userSockets.delete(userId);
+}
+
+function pushToUser(userId, payload) {
+  const set = userSockets.get(userId);
+  if (!set || set.size === 0) return;
+  const msg = JSON.stringify(payload);
+  for (const ws of set) {
+    if (ws.readyState === ws.OPEN) ws.send(msg);
+  }
 }
 
 async function refreshUserInIndex(userId) {
@@ -206,6 +273,15 @@ async function refreshUserInIndex(userId) {
   // thereafter (insert() handles both cases). Keyed by wallet_id, which
   // never changes once assigned, so this is safe to call every time.
   walletAvl.insert(row.wallet_id, row);
+
+  // Push the fresh balance straight to any connected device for this
+  // user — this is what makes an incoming transfer show up live instead
+  // of waiting for the next poll/login. Every route that changes a
+  // balance (send, wallet pay, group withdraw approval, loan payout,
+  // admin reversal, undo, etc.) already calls refreshUserInIndex() for
+  // every affected user right after commit, so hooking it here covers
+  // all of them for free instead of needing a push call at each one.
+  pushToUser(userId, { type: 'balance', balanceCentavos: toCentavos(row.balance) });
 }
 
 // ---------- money handling: integer centavos everywhere (item #1 fix) ----------
@@ -252,13 +328,21 @@ function centavosToPesosLabel(centavos) {
   return (centavos / 100).toFixed(2);
 }
 
+// Pinned explicitly on both sign and verify so a token is only ever
+// accepted under the one algorithm this server actually issues — jwt.verify
+// otherwise accepts whatever algorithm family matches the secret's type,
+// which is unnecessary attack surface to leave open even though a
+// symmetric secret isn't vulnerable to the classic RS256->HS256 confusion
+// attack.
+const JWT_ALGORITHM = 'HS256';
+
 function sign(payload, expiresIn) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn, algorithm: JWT_ALGORITHM });
 }
 
 function verify(token) {
   try {
-    return jwt.verify(token, JWT_SECRET);
+    return jwt.verify(token, JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
   } catch {
     return null;
   }
@@ -291,7 +375,7 @@ function requireAdmin(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   const payload = token && verify(token);
-  if (!payload || payload.role !== 'admin') {
+  if (!payload || payload.role !== 'admin' || payload.stage !== 'full') {
     return res.status(401).json({ error: 'Not authenticated as admin' });
   }
   req.adminId = payload.uid;
@@ -309,24 +393,35 @@ function requireAdmin(req, res, next) {
 // UI already implies client-side, except enforced here on the server so
 // it can't be bypassed by calling the API directly (as our own curl
 // testing demonstrated the client-side version could be).
-const MAX_LOGIN_ATTEMPTS = 3;
-const LOCKOUT_MS = 30 * 1000; // 30 seconds
+// Escalating lockout tiers, strictest first. A flat "3 attempts, wait 30s"
+// forever is cheap for an attacker to grind through indefinitely,
+// especially against a 4-digit PIN (10,000 possibilities) — so repeated
+// cycles of failures now escalate into much longer locks instead of
+// resetting to the same 30s cost every time.
+const LOCKOUT_TIERS = [
+  { attempts: 10, lockoutSeconds: 30 * 60 }, // 10 failures in 30 min -> 30 min lock
+  { attempts: 6, lockoutSeconds: 5 * 60 },   // 6 failures in 5 min -> 5 min lock
+  { attempts: 3, lockoutSeconds: 30 },       // 3 failures in 30 sec -> 30 sec lock
+];
 
 // Returns null if not locked, or the number of seconds remaining if it is.
 async function checkLockout(identifier) {
-  const [[{ count }]] = await pool.query(
-    'SELECT COUNT(*) AS count FROM login_attempts WHERE identifier = ? AND attempted_at > (NOW() - INTERVAL ? SECOND)',
-    [identifier, LOCKOUT_MS / 1000]
-  );
-  if (count < MAX_LOGIN_ATTEMPTS) return null;
+  for (const tier of LOCKOUT_TIERS) {
+    const [[{ count }]] = await pool.query(
+      'SELECT COUNT(*) AS count FROM login_attempts WHERE identifier = ? AND attempted_at > (NOW() - INTERVAL ? SECOND)',
+      [identifier, tier.lockoutSeconds]
+    );
+    if (count < tier.attempts) continue;
 
-  const [[oldest]] = await pool.query(
-    'SELECT attempted_at FROM login_attempts WHERE identifier = ? ORDER BY attempted_at DESC LIMIT 1 OFFSET ?',
-    [identifier, MAX_LOGIN_ATTEMPTS - 1]
-  );
-  const unlockAt = new Date(oldest.attempted_at).getTime() + LOCKOUT_MS;
-  const secondsLeft = Math.max(1, Math.ceil((unlockAt - Date.now()) / 1000));
-  return secondsLeft;
+    const [[oldest]] = await pool.query(
+      'SELECT attempted_at FROM login_attempts WHERE identifier = ? ORDER BY attempted_at DESC LIMIT 1 OFFSET ?',
+      [identifier, tier.attempts - 1]
+    );
+    const unlockAt = new Date(oldest.attempted_at).getTime() + tier.lockoutSeconds * 1000;
+    const secondsLeft = Math.max(1, Math.ceil((unlockAt - Date.now()) / 1000));
+    if (secondsLeft > 0) return secondsLeft;
+  }
+  return null;
 }
 
 async function recordFailedAttempt(identifier) {
@@ -396,7 +491,7 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
   if (!username || !password || !pin || !phoneNumber) {
     return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
   }
-  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
   if (!/^09\d{9}$/.test(phoneNumber)) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
@@ -499,8 +594,12 @@ app.post('/api/login', authLimiter, asyncRoute(async (req, res) => {
     [username]
   );
   const user = rows[0];
-  const ok = user && (await bcrypt.compare(password, user.password_hash));
-  if (!ok) {
+  // Always run bcrypt, even when the username doesn't exist, so a lookup
+  // miss takes the same time as a real-but-wrong-password attempt —
+  // otherwise the instant-return-on-miss path leaks which usernames are
+  // registered via response timing.
+  const ok = await bcrypt.compare(password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
+  if (!user || !ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect username or password' });
   }
@@ -541,8 +640,8 @@ app.post('/api/login/verify-pin', pinLimiter, asyncRoute(async (req, res) => {
     payload.uid,
   ]);
   const user = rows[0];
-  const ok = user && (await bcrypt.compare(pin, user.pin_hash));
-  if (!ok) {
+  const ok = await bcrypt.compare(pin, user ? user.pin_hash : DUMMY_BCRYPT_HASH);
+  if (!user || !ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect PIN' });
   }
@@ -844,10 +943,27 @@ app.get('/api/groups', requireAuth, asyncRoute(async (req, res) => {
   res.json(rows.map((g) => ({ ...g, balance: toCentavos(g.balance) })));
 }));
 
+// Shared by every /api/groups/:id... route below: confirms req.userId is
+// actually a member of groupId before any group-internal data (balance,
+// transactions, member list w/ wallet IDs, requests) is returned. Without
+// this, any authenticated user could read any group's data just by
+// guessing/incrementing IDs — group membership, not just login, is the
+// access boundary here.
+async function requireGroupMembership(groupId, userId) {
+  const [[membership]] = await pool.query(
+    'SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+    [groupId, userId]
+  );
+  return !!membership;
+}
+
 app.get('/api/groups/:id', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
+  }
+  if (!(await requireGroupMembership(groupId, req.userId))) {
+    return res.status(403).json({ error: 'Not a member of this group' });
   }
   const [[group]] = await pool.query('SELECT id, name, balance FROM `groups` WHERE id = ?', [groupId]);
   if (!group) return res.status(404).json({ error: 'Group not found' });
@@ -865,6 +981,9 @@ app.get('/api/groups/:id/transactions', requireAuth, asyncRoute(async (req, res)
   if (!Number.isInteger(groupId)) {
     return res.status(400).json({ error: 'Invalid group ID' });
   }
+  if (!(await requireGroupMembership(groupId, req.userId))) {
+    return res.status(403).json({ error: 'Not a member of this group' });
+  }
   const [rows] = await pool.execute(
     `SELECT id, label, type, amount, is_credit AS isCredit, created_at AS createdAt
      FROM transactions
@@ -877,6 +996,9 @@ app.get('/api/groups/:id/transactions', requireAuth, asyncRoute(async (req, res)
 
 app.get('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) => {
   const groupId = Number(req.params.id);
+  if (!(await requireGroupMembership(groupId, req.userId))) {
+    return res.status(403).json({ error: 'Not a member of this group' });
+  }
   const [rows] = await pool.execute(
     `SELECT id, requester_name AS requesterName, reason, amount, status, created_at AS createdAt
      FROM withdrawal_requests
@@ -1205,6 +1327,15 @@ app.post('/api/groups/:id/requests', requireAuth, asyncRoute(async (req, res) =>
   if (!requesterName || !reason || amt === null) {
     return res.status(400).json({ error: 'requesterName, reason, and a positive amount (integer centavos) are required' });
   }
+  // A member-only gate: approving one of these debits the group balance
+  // directly (see /api/admin/groups/:groupId/requests/:reqId/respond),
+  // with no recipient account tied to the request — so without this
+  // check, anyone with a login (member or not) could plant a request
+  // against an arbitrary group and rely on an admin approving it based
+  // on the free-text requesterName/reason alone.
+  if (!(await requireGroupMembership(groupId, req.userId))) {
+    return res.status(403).json({ error: 'Not a member of this group' });
+  }
   await pool.execute(
     'INSERT INTO withdrawal_requests (group_id, requester_name, reason, amount) VALUES (?,?,?,?)',
     [groupId, requesterName, reason, amt]
@@ -1362,6 +1493,7 @@ app.delete('/api/savings/:id', requireAuth, asyncRoute(async (req, res) => {
 
 // ---------- admin: login + final say on groups (item #13) ----------
 
+// Step 1: password only.
 app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username is required' });
@@ -1372,15 +1504,48 @@ app.post('/api/admin/login', adminLimiter, asyncRoute(async (req, res) => {
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
   }
 
-  const [rows] = await pool.execute('SELECT id, password_hash FROM admins WHERE username = ?', [username]);
+  const [rows] = await pool.execute('SELECT id, password_hash, pin_hash FROM admins WHERE username = ?', [username]);
   const admin = rows[0];
-  const ok = admin && (await bcrypt.compare(password || '', admin.password_hash));
-  if (!ok) {
+  const ok = await bcrypt.compare(password || '', admin ? admin.password_hash : DUMMY_BCRYPT_HASH);
+  if (!admin || !ok) {
     await recordFailedAttempt(identifier);
     return res.status(401).json({ error: 'Incorrect admin credentials' });
   }
+  if (!admin.pin_hash) {
+    return res.status(403).json({
+      error: 'This admin account has no PIN set yet. Run `npm run create-admin -- <username> <password> <pin>` to set one before logging in.',
+    });
+  }
   await clearAttempts(identifier);
-  const token = sign({ uid: admin.id, role: 'admin' }, '4h');
+
+  const pendingToken = sign({ uid: admin.id, stage: 'pending', role: 'admin' }, '5m');
+  res.json({ pendingToken });
+}));
+
+// Step 2: the PIN.
+app.post('/api/admin/login/verify-pin', adminPinLimiter, asyncRoute(async (req, res) => {
+  const { pendingToken, pin } = req.body || {};
+  const payload = pendingToken && verify(pendingToken);
+  if (!payload || payload.stage !== 'pending' || payload.role !== 'admin') {
+    return res.status(401).json({ error: 'Login session expired, please log in again' });
+  }
+
+  const identifier = `adminpin:${payload.uid}`;
+  const lockedForSeconds = await checkLockout(identifier);
+  if (lockedForSeconds !== null) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedForSeconds} second(s).` });
+  }
+
+  const [rows] = await pool.execute('SELECT id, pin_hash FROM admins WHERE id = ?', [payload.uid]);
+  const admin = rows[0];
+  const ok = await bcrypt.compare(pin || '', admin ? admin.pin_hash : DUMMY_BCRYPT_HASH);
+  if (!admin || !ok) {
+    await recordFailedAttempt(identifier);
+    return res.status(401).json({ error: 'Incorrect PIN' });
+  }
+  await clearAttempts(identifier);
+
+  const token = sign({ uid: admin.id, stage: 'full', role: 'admin' }, '4h');
   res.json({ token });
 }));
 
@@ -1946,13 +2111,13 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
   const loanId = Number(req.params.id);
   const approve = !!req.body?.approve;
 
-  // NEW — enforce FIFO: admins must resolve the oldest pending loan first.
-  const front = loanQueue.peek();
-  if (front && front.loanId !== loanId) {
-    return res.status(409).json({
-      error: `Loans must be processed in submission order — resolve loan #${front.loanId} first`,
-    });
-  }
+  // Oldest-first is enforced as a *display* priority (see GET /api/admin/loans'
+  // ORDER BY and /api/admin/loans/queue/next), not as a hard gate here —
+  // with more than one admin online, forcing everyone through a single
+  // front-of-queue loan serializes all approval work through one door
+  // regardless of admin count. The actual safety against two admins
+  // colliding on the *same* loan comes from the row lock + already-voted
+  // check just below, not from queue order.
 
   const conn = await pool.getConnection();
   try {
@@ -1984,7 +2149,7 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
     if (!approve) {
       await conn.execute("UPDATE loans SET status = 'declined', decided_at = NOW() WHERE id = ?", [loanId]);
       await conn.commit();
-      loanQueue.dequeue(); // NEW — loan is finalized, remove from the front
+      loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
       return res.json({ ok: true, status: 'declined' });
     }
 
@@ -2012,13 +2177,13 @@ app.post('/api/admin/loans/:id/respond', requireAdmin, asyncRoute(async (req, re
       await conn.commit();
 
       await refreshUserInIndex(loan.user_id);
-      loanQueue.dequeue(); // NEW — loan is finalized, remove from the front
+      loanQueue.remove(loanId); // finalized — remove wherever it sits in the queue, not just the front
 
       return res.json({ ok: true, status: 'approved' });
     }
 
-    // Still needs more admin approvals — stays at the front of the queue,
-    // since it's not finalized yet.
+    // Still needs more admin approvals — stays in the queue, since it's
+    // not finalized yet.
     await conn.commit();
     res.json({ ok: true, status: 'pending', approvalsCount: approvals, approvalsNeeded: loan.approvals_needed });
   } catch (err) {
@@ -2153,6 +2318,66 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// ---------- WebSocket server: live balance updates ----------
+// Wrapping the Express app in a plain http.Server lets the same port
+// serve both the REST API and the WebSocket upgrade at /ws — no second
+// port/process to deploy or configure.
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', (ws, req) => {
+  // The client can't attach an Authorization header to a WebSocket
+  // handshake on every platform (Flutter web in particular), so the same
+  // session token used for REST calls is passed as a query param instead:
+  // wss://host/ws?token=<jwt>. It's verified with the exact same
+  // requireAuth rules — full stage, user role — as any REST route.
+  let userId;
+  try {
+    const { searchParams } = new URL(req.url, 'http://localhost');
+    const payload = verify(searchParams.get('token'));
+    if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
+      ws.close(4001, 'Not authenticated');
+      return;
+    }
+    userId = payload.uid;
+  } catch {
+    ws.close(4001, 'Not authenticated');
+    return;
+  }
+
+  registerSocket(userId, ws);
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+  ws.on('close', () => unregisterSocket(userId, ws));
+  ws.on('error', () => unregisterSocket(userId, ws));
+
+  // Send the current balance immediately on connect, so the client has a
+  // correct number even if it connects between polls/actions.
+  pool
+    .query('SELECT balance FROM users WHERE id = ?', [userId])
+    .then(([[row]]) => {
+      if (row) pushToUser(userId, { type: 'balance', balanceCentavos: toCentavos(row.balance) });
+    })
+    .catch(() => {});
+});
+
+// Phones and flaky networks often drop a WebSocket without a clean close
+// frame. Ping every 30s and terminate anything that didn't pong back
+// since the last check, so userSockets doesn't accumulate dead entries.
+const wsHeartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 30000);
+wss.on('close', () => clearInterval(wsHeartbeat));
+
 const port = process.env.PORT || 3000;
 Promise.all([
   loadIndexesFromDatabase(),
@@ -2160,7 +2385,7 @@ Promise.all([
   loadAccountListFromDatabase(),
   loadWalletAvlFromDatabase(),
 ]).then(() => {
-  app.listen(port, () => console.log(`PayCST backend listening on port ${port}`));
+  server.listen(port, () => console.log(`PayCST backend listening on port ${port} (HTTP + WebSocket /ws)`));
 });
 
 // ---------- provider network simulation and DB migration notes below are unchanged ----------
