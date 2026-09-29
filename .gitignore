@@ -2,8 +2,8 @@
 node_modules/
 npm-debug.log*
 update_pass.sql
-nodeserver.js.backup
 update_admin_pass.sql
-backup_before_centavos_migration.sql
+server.js.backup
+backup_*.sql
 temp_migration.sql
 desktop.ini
