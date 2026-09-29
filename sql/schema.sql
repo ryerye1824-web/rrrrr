@@ -17,11 +17,15 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB;
 
 -- Separate admin table so admin auth never shares a namespace or a hash
--- scheme decision with regular user auth.
+-- scheme decision with regular user auth. pin_hash mirrors the user
+-- table's second factor — nullable so existing rows aren't broken by
+-- this migration, but /api/admin/login refuses to issue a session for
+-- any admin whose pin_hash is still NULL (see server.js).
 CREATE TABLE IF NOT EXISTS admins (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(50) NOT NULL UNIQUE,
   password_hash CHAR(60) NOT NULL,
+  pin_hash CHAR(60) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 

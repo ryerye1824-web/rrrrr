@@ -16,9 +16,10 @@
     "express-rate-limit": "^8.6.2",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.2",
-    "mysql2": "^3.10.0"
+    "mysql2": "^3.10.0",
+    "ws": "^8.22.0"
   },
   "allowScripts": {
-    "bcrypt@5.1.1": true
+    "bcrypt@6.0.0": true
   }
 }

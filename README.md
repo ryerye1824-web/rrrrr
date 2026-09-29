@@ -29,7 +29,9 @@ that can move money.
   transaction, so two people can't both squeeze into the last slot at once.
 - Admin has a separate login, a separate `admins` table, and its own
   endpoints to view every group's members, remove a member, and approve or
-  decline a support request (item #13).
+  decline a support request (item #13). Admin login is two-factor —
+  password then a separate PIN, mirroring the user login flow — so a
+  leaked admin password alone isn't enough to get in.
 
 ## Setup
 
@@ -38,11 +40,16 @@ cd backend
 cp .env.example .env    # fill in your MySQL credentials + a random JWT_SECRET
 npm install
 mysql -u root -p < sql/schema.sql
-npm run create-admin -- youradminname a-strong-password
+npm run create-admin -- youradminname a-strong-password 1234
 npm start
 ```
 
 The server listens on `http://localhost:3000` (or `PORT` from `.env`).
+
+If you already have a deployed database from before admin PINs existed,
+run `mysql -u root -p paycst < sql/add_admin_pin.sql` first, then use
+`create-admin` (same command as above) to set a PIN for each existing
+admin — they can't get a full session until they have one.
 
 ## What's NOT included yet
 
