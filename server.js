@@ -111,14 +111,19 @@ app.use(helmet());
 // breaks before you're ready to lock it down.
 const corsOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)
-  : true; // true = reflect any origin (cors package default)
-app.use(cors({ origin: corsOrigins }));
+  : null;
+if (!corsOrigins) {
+  console.warn('WARNING: CORS_ORIGIN is not set - any website origin is allowed. Set it in production.');
+}
+app.use(cors({ origin: corsOrigins || true }));
 // Default express.json() limit is 100kb, which is too small for the
 // base64-encoded ID front/back + selfie photos that /api/register sends —
 // that route was almost certainly failing with a 413 before this. 15mb
 // gives real photos room while still capping the body so a client can't
 // send an unbounded payload as a cheap DoS.
-app.use(express.json({ limit: '15mb' }));
+// Large body (ID + selfie photos) only on registration; everything else 100kb.
+app.use('/api/register', express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '100kb' }));
 
 // Rate limiting on the endpoints most worth protecting against
 // brute-force/credential-stuffing. A 4-digit PIN only has 10,000 possible
@@ -190,6 +195,10 @@ const adminPinLimiter = rateLimit({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error('FATAL: JWT_SECRET is missing or shorter than 32 characters.');
+  process.exit(1);
+}
 
 // A precomputed bcrypt hash of a value nobody will ever type, used to keep
 // login timing constant whether or not the username exists. Without this,
@@ -360,15 +369,26 @@ function asyncRoute(handler) {
 }
 
 // Requires a FULL session token (password + PIN both verified).
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  const payload = token && verify(token);
-  if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
-    return res.status(401).json({ error: 'Not authenticated' });
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    const payload = token && verify(token);
+    if (!payload || payload.stage !== 'full' || payload.role !== 'user') {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    // Suspension must take effect immediately, not only at the next login -
+    // a 12h token issued before suspension would otherwise keep working.
+    const [[row]] = await pool.query('SELECT status FROM users WHERE id = ?', [payload.uid]);
+    if (!row) return res.status(401).json({ error: 'Not authenticated' });
+    if (row.status === 'suspended') {
+      return res.status(403).json({ error: 'This account has been suspended. Contact support for assistance.' });
+    }
+    req.userId = payload.uid;
+    next();
+  } catch (err) {
+    next(err);
   }
-  req.userId = payload.uid;
-  next();
 }
 
 function requireAdmin(req, res, next) {
@@ -479,7 +499,95 @@ async function compareFaces(image1Base64, image2Base64) {
   return { confidence, matched: confidence >= 65 };
 }
 
+// ---------- Face++ duplicate-face check (one face = one account) ----------
+//
+// compareFaces() above only checks that the selfie matches the ID photo in the
+// SAME submission. It can't tell if this face already has another account. For
+// that, every registered selfie is stored in a Face++ FaceSet and each new
+// selfie is searched against it. If any Face++ call fails the check is
+// skipped (fail-open, same as compareFaces) so registration never breaks.
+const FACEPP_BASE = 'https://api-us.faceplusplus.com/facepp/v3';
+const FACESET_OUTER_ID = process.env.FACESET_OUTER_ID || 'paycst_users';
+// Similarity (0-100) at or above which a new selfie counts as "already registered".
+const FACE_DUPLICATE_THRESHOLD = Number(process.env.FACE_DUPLICATE_THRESHOLD || 80);
+let faceSetReady = false;
+
+async function faceppPost(path, fields) {
+  const form = new URLSearchParams();
+  form.set('api_key', FACEPP_API_KEY);
+  form.set('api_secret', FACEPP_API_SECRET);
+  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+  const res = await fetch(`${FACEPP_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const data = await res.json();
+  if (!res.ok || data.error_message) throw new Error(data.error_message || `Face++ ${path} failed`);
+  return data;
+}
+
+async function ensureFaceSet() {
+  if (faceSetReady) return;
+  try {
+    await faceppPost('/faceset/create', { outer_id: FACESET_OUTER_ID, display_name: 'PayCST users' });
+  } catch (err) {
+    if (!/FACESET_EXIST/i.test(err.message)) throw err;
+  }
+  faceSetReady = true;
+}
+
+async function detectFaceToken(imageBase64) {
+  const data = await faceppPost('/detect', { image_base64: imageBase64 });
+  if (!data.faces?.length) throw new Error('No face detected in selfie');
+  return data.faces[0].face_token;
+}
+
+// Returns the best match ({ confidence, ... }) if this face is already in the
+// FaceSet at/above the threshold, otherwise null.
+async function findDuplicateFace(faceToken) {
+  try {
+    const data = await faceppPost('/search', { face_token: faceToken, outer_id: FACESET_OUTER_ID });
+    const top = data.results?.[0];
+    return top && top.confidence >= FACE_DUPLICATE_THRESHOLD ? top : null;
+  } catch (err) {
+    if (/EMPTY_FACESET|FACESET_NOT_FOUND/i.test(err.message)) return null; // nobody registered yet
+    throw err;
+  }
+}
+
+async function addFaceToIndex(faceToken) {
+  await faceppPost('/faceset/addface', { outer_id: FACESET_OUTER_ID, face_tokens: faceToken });
+}
+
+// Lets the app tell people "username / number already used" BEFORE they go
+// through the ID + selfie scan. Answers only those two yes/no questions.
+const availabilityLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
 // ---------- registration / login (password, THEN pin) ----------
+
+app.get('/api/register/check', availabilityLimiter, asyncRoute(async (req, res) => {
+  const username = (req.query.username || '').toString().trim();
+  const phone = (req.query.phone || '').toString().trim();
+  let usernameTaken = false;
+  let phoneTaken = false;
+  if (username) {
+    const [rows] = await pool.execute('SELECT id FROM users WHERE username = ?', [username]);
+    usernameTaken = rows.length > 0;
+  }
+  if (phone) {
+    const [rows] = await pool.execute('SELECT id FROM users WHERE phone_number = ? OR wallet_id = ?', [phone, phone]);
+    phoneTaken = rows.length > 0;
+  }
+  res.json({ usernameTaken, phoneTaken });
+}));
 
 app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
    const {
@@ -491,7 +599,12 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
   if (!username || !password || !pin || !phoneNumber) {
     return res.status(400).json({ error: 'username, password, pin, and phoneNumber are required' });
   }
-  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  // Same rules as the app's checklist: 8+ chars, a letter, a number, and one of @ * _ -
+  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/[@*_-]/.test(password)) {
+    return res.status(400).json({
+      error: 'Password must be at least 8 characters and include a letter, a number, and one of @ * _ -',
+    });
+  }
   if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
   if (!/^09\d{9}$/.test(phoneNumber)) {
     return res.status(400).json({ error: 'Phone number must be 11 digits starting with 09 (e.g. 09171234567)' });
@@ -506,6 +619,9 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
     return res.status(400).json({ error: 'Photos of the front and back of your ID, plus a live selfie, are required' });
   }
 
+  // Same ID written differently ("ab-123 456" vs "AB123456") must count as one.
+  const normalizedId = governmentIdNumber.toString().toUpperCase().replace(/[\s-]/g, '');
+
   const conn = await pool.getConnection();
   try {
     if (usersByUsername.has(username)) {
@@ -519,17 +635,34 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
       return res.status(409).json({ error: 'That phone number is already registered to an account' });
     }
 
-    const [existingId] = await conn.execute('SELECT id FROM users WHERE government_id_number = ?', [
-      governmentIdNumber.toString().trim(),
-    ]);
+    const [existingId] = await conn.execute(
+      "SELECT id FROM users WHERE REPLACE(REPLACE(UPPER(government_id_number), ' ', ''), '-', '') = ?",
+      [normalizedId]
+    );
     if (existingId.length > 0) {
       return res.status(409).json({ error: 'That government ID is already registered to an account' });
     }
 
+    // One face = one account: search the new selfie against every selfie
+    // already registered. Skipped (not blocked) if Face++ is unavailable.
+    let selfieFaceToken = null;
+    if (FACEPP_API_KEY && FACEPP_API_SECRET) {
+      try {
+        await ensureFaceSet();
+        selfieFaceToken = await detectFaceToken(selfiePhotoBase64);
+        const duplicateFace = await findDuplicateFace(selfieFaceToken);
+        if (duplicateFace) {
+          return res.status(409).json({ error: 'This face is already registered to another account' });
+        }
+      } catch (err) {
+        console.error('Duplicate-face check skipped:', err.message);
+        selfieFaceToken = null;
+      }
+    }
+
     // Face match: compares the live selfie against the photo on the ID. This
-    // is the "cannot create another account" enforcement for a DIFFERENT id
-    // number under a face that's already registered — the username/phone/ID
-    // checks above only catch exact duplicates of those specific fields.
+    // only confirms the selfie matches THIS ID photo; the duplicate-face search
+    // just above is what stops the same face registering under another account.
     let confidence = null;
     let verificationStatus = 'pending';
     try {
@@ -548,7 +681,9 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
     const pinHash = await bcrypt.hash(pin, 10);
     const walletId = phoneNumber;
 
-        const [result] = await conn.execute(
+    let result;
+    try {
+      [result] = await conn.execute(
       `INSERT INTO users
          (username, password_hash, pin_hash, wallet_id, balance, phone_number,
           government_id_number, government_id_photo, government_id_photo_back, selfie_photo,
@@ -556,10 +691,32 @@ app.post('/api/register', authLimiter, asyncRoute(async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)`,
       [
         username, passwordHash, pinHash, walletId, 0, phoneNumber,
-        governmentIdNumber.toString().trim(), governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
+        normalizedId, governmentIdPhotoFrontBase64, governmentIdPhotoBackBase64, selfiePhotoBase64,
         verificationStatus, confidence,
       ]
     );
+    } catch (err) {
+      // Two sign-ups racing each other can both pass the SELECT checks above;
+      // the database's UNIQUE keys (see sql/add_unique_constraints.sql) catch that.
+      if (err.code === 'ER_DUP_ENTRY') {
+        const m = err.sqlMessage || '';
+        const msg = /phone|wallet/i.test(m)
+          ? 'That phone number is already registered to an account'
+          : /government|gov_id/i.test(m)
+            ? 'That government ID is already registered to an account'
+            : 'That username is already taken';
+        return res.status(409).json({ error: msg });
+      }
+      throw err;
+    }
+
+    if (selfieFaceToken) {
+      try {
+        await addFaceToIndex(selfieFaceToken);
+      } catch (err) {
+        console.error('Could not add face to index:', err.message);
+      }
+    }
 
     await refreshUserInIndex(result.insertId);
 
